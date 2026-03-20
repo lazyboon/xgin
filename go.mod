@@ -1,4 +1,4 @@
-module xgin
+module github.com/lazyboon/xgin
 
 go 1.25.0
 
