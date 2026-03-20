@@ -2,6 +2,7 @@ package xgin
 
 import (
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
 // Context wraps gin.Context to provide extended functionality
@@ -18,29 +19,29 @@ func NewContext(c *gin.Context) *Context {
 	}
 }
 
-// AutoBind performs a multi-source binding and recursive validation.
-// It sequentially binds URI, Header, and Request Body parameters.
+// AutoBind handles multi-source parameter binding and dual-stage validation.
+// It follows a "Silent Fill -> Final Bind -> Recursive Validate" pattern
+// to ensure all fields (Header/URI/Query/Body) are populated before global validation.
 func (c *Context) AutoBind(obj any) error {
-	// 1. Bind URI Path Parameters
+	req := c.Request
+
+	// 1. Silent Fill: Populate non-body sources without triggering validation tags.
 	if len(c.Params) > 0 {
-		if err := c.ShouldBindUri(obj); err != nil {
-			return err
+		m := make(map[string][]string)
+		for _, v := range c.Params {
+			m[v.Key] = []string{v.Value}
 		}
+		_ = binding.Uri.BindUri(m, obj)
 	}
+	_ = binding.Query.Bind(req, obj)
+	_ = binding.Header.Bind(req, obj)
 
-	// 2. Bind Request Headers
-	// Note: ShouldBindHeader is strict; ensure the DTO uses `header` tags.
-	if err := c.ShouldBindHeader(obj); err != nil {
-		return err
-	}
-
-	// 3. Bind Request Body (JSON, XML, Form, etc. based on Content-Type)
+	// 2. Final Bind & Base Validation: Bind request body and trigger all 'binding' tags.
 	if err := c.ShouldBind(obj); err != nil {
 		return err
 	}
 
-	// 4. Execute Recursive Validation Engine
-	// This triggers the IValidator interface and deep-scans nested structs/slices.
+	// 3. Recursive Business Validation: Execute the custom IValidator interface.
 	return c.validator.Validate(obj)
 }
 
