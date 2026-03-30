@@ -3,6 +3,7 @@ package xgin
 import (
 	"errors"
 	"net/http"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/render"
@@ -27,7 +28,66 @@ var (
 
 	// HookerAfterResponse executes after the response has been written.
 	HookerAfterResponse func(ctx *gin.Context, response Response)
+
+	hooksMu sync.RWMutex
 )
+
+type hookers struct {
+	bindingError      func(ctx *gin.Context, err error)
+	transformResponse func(response Response) any
+	beforeResponse    func(ctx *gin.Context, response Response) (stop bool)
+	afterResponse     func(ctx *gin.Context, response Response)
+}
+
+func loadHookers() hookers {
+	hooksMu.RLock()
+	defer hooksMu.RUnlock()
+	return hookers{
+		bindingError:      HookerBindingError,
+		transformResponse: HookerTransformResponse,
+		beforeResponse:    HookerBeforeResponse,
+		afterResponse:     HookerAfterResponse,
+	}
+}
+
+func getValidatorMaxDepth() int {
+	hooksMu.RLock()
+	defer hooksMu.RUnlock()
+	return ValidatorMaxDepth
+}
+
+func SetValidatorMaxDepth(depth int) {
+	if depth <= 0 {
+		depth = 20
+	}
+	hooksMu.Lock()
+	ValidatorMaxDepth = depth
+	hooksMu.Unlock()
+}
+
+func SetHookerBindingError(h func(ctx *gin.Context, err error)) {
+	hooksMu.Lock()
+	HookerBindingError = h
+	hooksMu.Unlock()
+}
+
+func SetHookerTransformResponse(h func(response Response) any) {
+	hooksMu.Lock()
+	HookerTransformResponse = h
+	hooksMu.Unlock()
+}
+
+func SetHookerBeforeResponse(h func(ctx *gin.Context, response Response) (stop bool)) {
+	hooksMu.Lock()
+	HookerBeforeResponse = h
+	hooksMu.Unlock()
+}
+
+func SetHookerAfterResponse(h func(ctx *gin.Context, response Response)) {
+	hooksMu.Lock()
+	HookerAfterResponse = h
+	hooksMu.Unlock()
+}
 
 // HandlerFunc defines the signature for type-safe generic handlers with request DTO.
 type HandlerFunc[T any] func(ctx *Context, req *T) Response
@@ -37,11 +97,12 @@ func Handle[T any](h HandlerFunc[T]) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx := NewContext(c)
 		var req T
+		hks := loadHookers()
 
 		// 1. Automated multi-source binding and recursive validation
 		if err := ctx.AutoBind(&req); err != nil {
-			if HookerBindingError != nil {
-				HookerBindingError(c, err)
+			if hks.bindingError != nil {
+				hks.bindingError(c, err)
 			} else {
 				if !c.IsAborted() {
 					c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -78,6 +139,8 @@ func Wrap(handler func(ctx *Context) Response) gin.HandlerFunc {
 
 // renderResponse dispatches the result to the client based on the specified ContentType.
 func renderResponse(c *gin.Context, r Response) {
+	status := normalizeStatus(r)
+
 	// Apply custom HTTP Headers
 	for key, val := range r.Header {
 		c.Header(key, val)
@@ -85,47 +148,59 @@ func renderResponse(c *gin.Context, r Response) {
 
 	// Apply global response transformation if defined
 	var finalOutput any = r
-	if HookerTransformResponse != nil {
-		finalOutput = HookerTransformResponse(r)
+	hks := loadHookers()
+	if hks.transformResponse != nil {
+		finalOutput = hks.transformResponse(r)
 	}
 
 	// Rendering Dispatcher
 	switch r.ContentType {
 	case ContentTypeJSON:
-		c.JSON(r.HttpStatus, finalOutput)
+		c.JSON(status, finalOutput)
 	case ContentTypeIndentedJSON:
-		c.IndentedJSON(r.HttpStatus, finalOutput)
+		c.IndentedJSON(status, finalOutput)
 	case ContentTypeSecureJSON:
-		c.SecureJSON(r.HttpStatus, finalOutput)
+		c.SecureJSON(status, finalOutput)
 	case ContentTypeJsonpJSON:
-		c.JSONP(r.HttpStatus, finalOutput)
+		c.JSONP(status, finalOutput)
 	case ContentTypeAsciiJSON:
-		c.AsciiJSON(r.HttpStatus, finalOutput)
+		c.AsciiJSON(status, finalOutput)
 	case ContentTypePureJSON:
-		c.PureJSON(r.HttpStatus, finalOutput)
+		c.PureJSON(status, finalOutput)
 	case ContentTypeProtoBuf:
-		c.ProtoBuf(r.HttpStatus, finalOutput)
+		c.ProtoBuf(status, finalOutput)
 	case ContentTypeTOML:
-		c.TOML(r.HttpStatus, finalOutput)
+		c.TOML(status, finalOutput)
 	case ContentTypeXML:
-		c.XML(r.HttpStatus, finalOutput)
+		c.XML(status, finalOutput)
 	case ContentTypeYAML:
-		c.YAML(r.HttpStatus, finalOutput)
+		c.YAML(status, finalOutput)
 	case ContentTypeMsgPack:
-		c.Render(r.HttpStatus, render.MsgPack{Data: finalOutput})
+		c.Render(status, render.MsgPack{Data: finalOutput})
 	case ContentTypeString:
 		str := r.Msg
 		if s, ok := r.Data.(string); ok {
 			str = s
 		}
-		c.String(r.HttpStatus, str)
+		c.String(status, str)
 	case ContentTypeRedirect:
 		if url, ok := r.Data.(string); ok {
-			c.Redirect(r.HttpStatus, url)
+			c.Redirect(status, url)
 		}
 	case ContentTypeHTML:
-		c.HTML(r.HttpStatus, r.HtmlPath, r.Data)
+		c.HTML(status, r.HtmlPath, r.Data)
 	default:
-		c.JSON(r.HttpStatus, finalOutput)
+		c.JSON(status, finalOutput)
 	}
+}
+
+func normalizeStatus(r Response) int {
+	status := r.HttpStatus
+	if status >= 100 && status <= 999 {
+		return status
+	}
+	if r.ContentType == ContentTypeRedirect {
+		return http.StatusFound
+	}
+	return http.StatusOK
 }

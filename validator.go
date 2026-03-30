@@ -16,7 +16,8 @@ type IValidator interface {
 var (
 	iValidatorType    = reflect.TypeOf((*IValidator)(nil)).Elem()
 	validatorInstance *Validator
-	validatorOnce     sync.Once
+	validatorDepth    int
+	validatorMu       sync.RWMutex
 )
 
 // typeMetadata caches the structure and validation capabilities of a type.
@@ -55,16 +56,29 @@ func NewValidator(maxDepth int) *Validator {
 
 // SharedValidator returns a global singleton validator.
 func SharedValidator(maxDepth int) *Validator {
-	validatorOnce.Do(func() {
-		if validatorInstance == nil {
-			validatorInstance = NewValidator(maxDepth)
-		}
-	})
+	if maxDepth <= 0 {
+		maxDepth = 20
+	}
+
+	validatorMu.RLock()
+	curr := validatorInstance
+	currDepth := validatorDepth
+	validatorMu.RUnlock()
+	if curr != nil && currDepth == maxDepth {
+		return curr
+	}
+
+	validatorMu.Lock()
+	defer validatorMu.Unlock()
+	if validatorInstance == nil || validatorDepth != maxDepth {
+		validatorInstance = NewValidator(maxDepth)
+		validatorDepth = maxDepth
+	}
 	return validatorInstance
 }
 
 // Validate triggers the recursive validation process for the given object.
-func (v *Validator) Validate(obj any) error {
+func (v *Validator) Validate(obj any) (err error) {
 	if obj == nil {
 		return nil
 	}
@@ -72,6 +86,7 @@ func (v *Validator) Validate(obj any) error {
 	defer func() {
 		if r := recover(); r != nil {
 			_, _ = fmt.Fprintf(v.errLog, "[xgin.Validator Panic] %v\n", r)
+			err = fmt.Errorf("xgin.validator: panic recovered: %v", r)
 		}
 	}()
 
@@ -80,7 +95,8 @@ func (v *Validator) Validate(obj any) error {
 		val = reflect.ValueOf(obj)
 	}
 
-	return v.walk(val, 0)
+	err = v.walk(val, 0)
+	return err
 }
 
 // walk recursively traverses the object to execute IValidator implementations.

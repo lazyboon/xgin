@@ -34,8 +34,9 @@ type RecoveryOptions struct {
 // NewRecovery returns a high-reliability recovery middleware with trace support.
 func NewRecovery(options ...*RecoveryOptions) gin.HandlerFunc {
 	conf := &RecoveryOptions{
-		StackSkip: 3,
-		MaxStack:  50,
+		StackSkip:        3,
+		MaxStack:         50,
+		SensitiveHeaders: append([]string(nil), DefaultSensitiveHeaders...),
 	}
 
 	for _, opt := range options {
@@ -54,7 +55,9 @@ func NewRecovery(options ...*RecoveryOptions) gin.HandlerFunc {
 		if opt.StackSkip > 0 {
 			conf.StackSkip = opt.StackSkip
 		}
-		conf.SensitiveHeaders = opt.SensitiveHeaders
+		if opt.SensitiveHeaders != nil {
+			conf.SensitiveHeaders = opt.SensitiveHeaders
+		}
 	}
 
 	engine := &recoveryEngine{

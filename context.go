@@ -15,7 +15,7 @@ type Context struct {
 func NewContext(c *gin.Context) *Context {
 	return &Context{
 		Context:   c,
-		validator: SharedValidator(ValidatorMaxDepth),
+		validator: SharedValidator(getValidatorMaxDepth()),
 	}
 }
 
@@ -47,9 +47,11 @@ func (c *Context) AutoBind(obj any) error {
 
 // response wraps the rendering process with Before and After lifecycle hooks.
 func (c *Context) response(response Response, f func()) {
+	hks := loadHookers()
+
 	// Execute the Before-Response hook; allows interception or modification.
-	if HookerBeforeResponse != nil {
-		stop := HookerBeforeResponse(c.Context, response)
+	if hks.beforeResponse != nil {
+		stop := hks.beforeResponse(c.Context, response)
 		if stop {
 			return
 		}
@@ -59,7 +61,7 @@ func (c *Context) response(response Response, f func()) {
 	f()
 
 	// Execute the After-Response hook; ideal for logging or auditing.
-	if HookerAfterResponse != nil {
-		HookerAfterResponse(c.Context, response)
+	if hks.afterResponse != nil {
+		hks.afterResponse(c.Context, response)
 	}
 }

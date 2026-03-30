@@ -162,7 +162,7 @@ func (e *accessLogEngine) Handle(c *gin.Context) {
 				} else {
 					reqEntity.Body = []byte("[body too large]")
 					// Restore original body if too large for capture
-					c.Request.Body = io.MultiReader(bytes.NewReader(body), c.Request.Body).(io.ReadCloser)
+					c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), c.Request.Body))
 				}
 			}
 		}
