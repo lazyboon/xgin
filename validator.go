@@ -1,83 +1,67 @@
 package xgin
 
 import (
-	"fmt"
-	"io"
-	"os"
+	"errors"
 	"reflect"
+	"runtime/debug"
 	"sync"
 )
 
-// IValidator defines the interface for custom business logic validation.
+// ---------------------------------------------------------------------------------------------------------------------
+
+var (
+	// ErrMaxDepth reports excessive nesting or consecutive pointer/interface unwrapping.
+	ErrMaxDepth = errors.New("xgin: maximum recursion depth exceeded")
+
+	// ErrValidationPanic reports a panic in custom validation and indicates an internal error.
+	ErrValidationPanic = errors.New("xgin: validation panicked")
+)
+
+var iValidatorType = reflect.TypeFor[IValidator]()
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+// IValidator defines custom rules. Implementations must not mutate the value or its references.
 type IValidator interface {
 	Validate() error
 }
 
-var (
-	iValidatorType    = reflect.TypeOf((*IValidator)(nil)).Elem()
-	validatorInstance *Validator
-	validatorDepth    int
-	validatorMu       sync.RWMutex
-)
+// ---------------------------------------------------------------------------------------------------------------------
 
-// typeMetadata caches the structure and validation capabilities of a type.
+// typeMetadata caches validation support and fields requiring recursive traversal.
 type typeMetadata struct {
 	isValidator bool
-	kind        reflect.Kind
 	fields      []fieldMetadata
 }
 
-// fieldMetadata describes relevant metadata for struct fields.
+// fieldMetadata identifies an exported field to visit.
 type fieldMetadata struct {
-	index    int
-	isStruct bool
-	isSlice  bool
-	isPtr    bool
-	canValid bool
+	index int
 }
 
-// Validator handles recursive validation with metadata caching.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Validator recursively executes IValidator using an instance-local type cache.
+// Type metadata remains cached for the instance lifetime.
+// Gin binders are responsible for binding tag validation.
 type Validator struct {
 	maxDepth int
-	cache    sync.Map // concurrent-safe metadata cache
-	errLog   io.Writer
+	cache    sync.Map // Concurrent type metadata cache.
 }
 
-// NewValidator creates a new validator instance with a specified depth limit.
+// NewValidator creates a validator; nonpositive limits use the default depth.
+// Depth bounds object nesting and consecutive pointer/interface unwrapping separately.
 func NewValidator(maxDepth int) *Validator {
 	if maxDepth <= 0 {
-		maxDepth = 20
+		maxDepth = DefaultValidatorMaxDepth
 	}
 	return &Validator{
 		maxDepth: maxDepth,
-		errLog:   os.Stderr,
 	}
 }
 
-// SharedValidator returns a global singleton validator.
-func SharedValidator(maxDepth int) *Validator {
-	if maxDepth <= 0 {
-		maxDepth = 20
-	}
-
-	validatorMu.RLock()
-	curr := validatorInstance
-	currDepth := validatorDepth
-	validatorMu.RUnlock()
-	if curr != nil && currDepth == maxDepth {
-		return curr
-	}
-
-	validatorMu.Lock()
-	defer validatorMu.Unlock()
-	if validatorInstance == nil || validatorDepth != maxDepth {
-		validatorInstance = NewValidator(maxDepth)
-		validatorDepth = maxDepth
-	}
-	return validatorInstance
-}
-
-// Validate triggers the recursive validation process for the given object.
+// Validate checks parents before children and returns the first original rule error.
+// Nil values are skipped; validation panics retain diagnostic details in PanicError.
 func (v *Validator) Validate(obj any) (err error) {
 	if obj == nil {
 		return nil
@@ -85,8 +69,8 @@ func (v *Validator) Validate(obj any) (err error) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			_, _ = fmt.Fprintf(v.errLog, "[xgin.Validator Panic] %v\n", r)
-			err = fmt.Errorf("xgin.validator: panic recovered: %v", r)
+			// Keep panic details for internal diagnostics; the error mapper controls public output.
+			err = &PanicError{kind: ErrValidationPanic, value: r, stack: debug.Stack()}
 		}
 	}()
 
@@ -99,45 +83,43 @@ func (v *Validator) Validate(obj any) (err error) {
 	return err
 }
 
-// walk recursively traverses the object to execute IValidator implementations.
+// walk visits structs, containers, and pointer/interface wrappers.
 func (v *Validator) walk(val reflect.Value, depth int) error {
-	if depth > v.maxDepth {
-		return ErrMaxDepth
+	if !val.IsValid() || !val.CanInterface() {
+		return nil
 	}
 
 	curr := val
-	// Unpack pointers until the base value is reached
-	for curr.Kind() == reflect.Pointer {
+	// Bound unwrapping separately: a pointer/interface cycle never reaches a child walk.
+	for steps := 0; curr.Kind() == reflect.Pointer || curr.Kind() == reflect.Interface; steps++ {
 		if curr.IsNil() {
 			return nil
 		}
+		if steps >= v.maxDepth {
+			return ErrMaxDepth
+		}
 		curr = curr.Elem()
+	}
+	if depth > v.maxDepth {
+		return ErrMaxDepth
 	}
 
 	t := curr.Type()
 	meta := v.getMetadata(t)
 
-	// 1. Execute custom validation logic if supported
+	// Validate the current object before visiting its children.
 	if meta.isValidator {
 		if err := v.execute(curr); err != nil {
 			return err
 		}
 	}
 
-	// 2. Recursive traversal for container types
+	// Recurse into exported fields and container entries.
 	switch curr.Kind() {
 	case reflect.Struct:
 		for i := range meta.fields {
-			f := &meta.fields[i]
-			fieldVal := curr.Field(f.index)
-			if f.isPtr && fieldVal.IsNil() {
-				continue
-			}
-			// Only walk into fields that are structs, slices, or have a Validate method
-			if f.isStruct || f.isSlice || f.canValid {
-				if err := v.walk(fieldVal, depth+1); err != nil {
-					return err
-				}
+			if err := v.walk(curr.Field(meta.fields[i].index), depth+1); err != nil {
+				return err
 			}
 		}
 
@@ -151,7 +133,7 @@ func (v *Validator) walk(val reflect.Value, depth int) error {
 	case reflect.Map:
 		iter := curr.MapRange()
 		for iter.Next() {
-			// Validate both keys and values
+			// Both map keys and values can implement custom validation.
 			if err := v.walk(iter.Key(), depth+1); err != nil {
 				return err
 			}
@@ -167,17 +149,24 @@ func (v *Validator) walk(val reflect.Value, depth int) error {
 	return nil
 }
 
-// execute attempts to call the Validate method on the value or its pointer.
+// execute calls the value or pointer implementation of IValidator.
 func (v *Validator) execute(val reflect.Value) error {
+	// Map entries and other unaddressable values need a shallow copy for pointer receivers.
+	// Validation is read-only, so mutations through shared references are prohibited.
+	if !val.CanAddr() {
+		addressable := reflect.New(val.Type()).Elem()
+		addressable.Set(val)
+		val = addressable
+	}
 	var runner IValidator
-	// Try pointer receiver first
+	// Prefer pointer receivers, which also include value-receiver methods.
 	if val.CanAddr() {
 		addr := val.Addr()
 		if addr.Type().Implements(iValidatorType) {
 			runner = addr.Interface().(IValidator)
 		}
 	}
-	// Fallback to value receiver
+	// Fall back to the value implementation when needed.
 	if runner == nil && val.Type().Implements(iValidatorType) {
 		runner = val.Interface().(IValidator)
 	}
@@ -188,15 +177,15 @@ func (v *Validator) execute(val reflect.Value) error {
 	return nil
 }
 
-// getMetadata retrieves or generates type metadata for efficient traversal.
+// getMetadata returns cached validation and traversal metadata.
 func (v *Validator) getMetadata(t reflect.Type) *typeMetadata {
 	if m, ok := v.cache.Load(t); ok {
 		return m.(*typeMetadata)
 	}
 
-	m := &typeMetadata{kind: t.Kind()}
+	m := &typeMetadata{}
 
-	// Check if type or its pointer implements IValidator
+	// Check both method sets, including named scalar types.
 	if t.Implements(iValidatorType) || reflect.PointerTo(t).Implements(iValidatorType) {
 		m.isValidator = true
 	}
@@ -204,27 +193,26 @@ func (v *Validator) getMetadata(t reflect.Type) *typeMetadata {
 	if t.Kind() == reflect.Struct {
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
-			// Skip unexported fields (unless they are anonymous/embedded)
-			if f.PkgPath != "" && !f.Anonymous {
+			// Unexported fields, including anonymous fields, cannot be safely accessed.
+			if f.PkgPath != "" {
 				continue
 			}
 
 			ft := f.Type
-			isPtr := ft.Kind() == reflect.Pointer
-			if isPtr {
-				ft = ft.Elem()
+			switch ft.Kind() {
+			case reflect.Struct, reflect.Slice, reflect.Array, reflect.Map, reflect.Pointer, reflect.Interface:
+				// Containers and wrappers are inspected recursively by walk.
+			default:
+				if !ft.Implements(iValidatorType) && !reflect.PointerTo(ft).Implements(iValidatorType) {
+					continue
+				}
 			}
-
-			m.fields = append(m.fields, fieldMetadata{
-				index:    i,
-				isPtr:    isPtr,
-				isStruct: ft.Kind() == reflect.Struct,
-				isSlice:  ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array,
-				canValid: f.Type.Implements(iValidatorType) || reflect.PointerTo(f.Type).Implements(iValidatorType),
-			})
+			m.fields = append(m.fields, fieldMetadata{index: i})
 		}
 	}
 
 	v.cache.Store(t, m)
 	return m
 }
+
+// ---------------------------------------------------------------------------------------------------------------------

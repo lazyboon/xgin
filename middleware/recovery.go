@@ -1,230 +1,45 @@
 package middleware
 
 import (
-	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
-	"os"
-	"runtime"
-	"strings"
-	"time"
+	"runtime/debug"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
-// DefaultSensitiveHeaders provides a baseline for common sensitive headers to be masked.
-var DefaultSensitiveHeaders = []string{
-	"authorization", "proxy-authorization", "cookie", "set-cookie", "www-authenticate",
+// PanicError preserves an internal panic and its stack for server logs.
+// Applications must not send its Error or StackTrace output to clients.
+type PanicError struct {
+	value any
+	stack []byte
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-
-// RecoveryOptions defines the configuration for the recovery middleware.
-type RecoveryOptions struct {
-	LogCallback      func(c *gin.Context, msg string) // Callback for custom logging (e.g., Zap, Sentry)
-	Handler          func(c *gin.Context, err any)    // Custom response handler after a panic
-	StackSkip        int                              // Frames to skip in stack trace, default is 3
-	MaxStack         int                              // Max frames to capture, default is 50
-	SensitiveHeaders []string                         // Headers to be masked in logs
+// Error describes the panic for internal diagnostics.
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("xgin.middleware: panic: %v", e.value)
 }
 
-// NewRecovery returns a high-reliability recovery middleware with trace support.
-func NewRecovery(options ...*RecoveryOptions) gin.HandlerFunc {
-	conf := &RecoveryOptions{
-		StackSkip:        3,
-		MaxStack:         50,
-		SensitiveHeaders: append([]string(nil), DefaultSensitiveHeaders...),
-	}
-
-	for _, opt := range options {
-		if opt == nil {
-			continue
-		}
-		if opt.LogCallback != nil {
-			conf.LogCallback = opt.LogCallback
-		}
-		if opt.Handler != nil {
-			conf.Handler = opt.Handler
-		}
-		if opt.MaxStack > 0 {
-			conf.MaxStack = opt.MaxStack
-		}
-		if opt.StackSkip > 0 {
-			conf.StackSkip = opt.StackSkip
-		}
-		if opt.SensitiveHeaders != nil {
-			conf.SensitiveHeaders = opt.SensitiveHeaders
-		}
-	}
-
-	engine := &recoveryEngine{
-		conf: conf,
-		mask: make(map[string]struct{}, len(conf.SensitiveHeaders)),
-	}
-	for _, h := range conf.SensitiveHeaders {
-		engine.mask[strings.ToLower(strings.TrimSpace(h))] = struct{}{}
-	}
-
-	return engine.Handle
+// Unwrap preserves an error value used as the panic payload.
+func (e *PanicError) Unwrap() error {
+	err, _ := e.value.(error)
+	return err
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-
-// recoveryEngine internal logic processor to isolate namespace.
-type recoveryEngine struct {
-	conf *RecoveryOptions
-	mask map[string]struct{}
+// StackTrace returns the stack captured when the panic was recovered.
+func (e *PanicError) StackTrace() string {
+	return string(e.stack)
 }
 
-// Handle implements the gin.HandlerFunc interface.
-func (e *recoveryEngine) Handle(c *gin.Context) {
-	defer func() {
-		if err := recover(); err != nil {
-			// Double panic protection
-			defer func() {
-				if r := recover(); r != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "[Recovery] CRITICAL: Double panic: %v\n", r)
-				}
-			}()
-
-			isBroken := e.isBrokenPipe(err)
-			requestID := e.getRequestID(c)
-
-			var b strings.Builder
-			b.Grow(1024)
-
-			e.writeLogHeader(&b, requestID, isBroken, err)
-			e.writeRequestHeaders(&b, c)
-			e.writeStackTrace(&b)
-
-			logMsg := b.String()
-
-			if e.conf.LogCallback != nil {
-				e.conf.LogCallback(c, logMsg)
-			}
-
-			if isBroken {
-				if errObj, ok := err.(error); ok {
-					_ = c.Error(errObj)
-				}
-				c.Abort()
-			} else if e.conf.Handler != nil {
-				e.conf.Handler(c, err)
-			} else {
-				c.AbortWithStatus(http.StatusInternalServerError)
-			}
+// Recovery records handler panics without committing an error response.
+// Install ErrorHandler outside it to select the public error representation.
+// Gin retains its special broken connection handling, which does not write another response.
+func Recovery() gin.HandlerFunc {
+	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, value any) {
+		_ = c.Error(&PanicError{value: value, stack: debug.Stack()})
+		if !c.Writer.Written() {
+			c.Status(http.StatusInternalServerError)
 		}
-	}()
-	c.Next()
-}
-
-func (e *recoveryEngine) getRequestID(c *gin.Context) string {
-	if val, ok := c.Get("X-Request-ID"); ok {
-		if s, ok := val.(string); ok && s != "" {
-			return s
-		}
-	}
-	if s := c.GetHeader("X-Request-ID"); s != "" {
-		return s
-	}
-	return uuid.NewString()
-}
-
-func (e *recoveryEngine) writeLogHeader(b *strings.Builder, id string, isBroken bool, err any) {
-	logType := "PANIC"
-	if isBroken {
-		logType = "BROKEN_PIPE"
-	}
-	b.WriteString("[")
-	b.WriteString(time.Now().Format(time.RFC3339Nano))
-	b.WriteString("] [")
-	b.WriteString(logType)
-	b.WriteString("] ID:")
-	b.WriteString(id)
-	b.WriteString(" | Err: ")
-	b.WriteString(fmt.Sprint(err))
-}
-
-func (e *recoveryEngine) writeRequestHeaders(b *strings.Builder, c *gin.Context) {
-	b.WriteString("\nHeaders: ")
-	first := true
-	for k, v := range c.Request.Header {
-		if !first {
-			b.WriteString(" | ")
-		}
-		b.WriteString(k)
-		b.WriteString(": ")
-		if _, sensitive := e.mask[strings.ToLower(k)]; sensitive {
-			b.WriteString("******")
-		} else {
-			b.WriteString(strings.Join(v, ","))
-		}
-		first = false
-	}
-}
-
-func (e *recoveryEngine) writeStackTrace(b *strings.Builder) {
-	b.WriteString("\nStack:\n")
-
-	skip := e.conf.StackSkip
-	maxDepth := e.conf.MaxStack
-	if maxDepth <= 0 {
-		maxDepth = 50
-	}
-
-	for i := skip; ; i++ {
-		if (i - skip) >= maxDepth {
-			b.WriteString("  ... (max depth reached)\n")
-			break
-		}
-
-		pc, file, line, ok := runtime.Caller(i)
-		if !ok {
-			break
-		}
-
-		fnName := "???"
-		if fn := runtime.FuncForPC(pc); fn != nil {
-			fnName = fn.Name()
-			if lastSlash := strings.LastIndex(fnName, "/"); lastSlash >= 0 {
-				fnName = fnName[lastSlash+1:]
-			}
-		}
-
-		shortFile := file
-		if parts := strings.Split(file, "/"); len(parts) > 2 {
-			shortFile = strings.Join(parts[len(parts)-2:], "/")
-		}
-
-		_, _ = fmt.Fprintf(b, "  %s:%d [%s]\n", shortFile, line, fnName)
-	}
-}
-
-// isBrokenPipe checks if the error is related to a closed/broken network connection.
-func (e *recoveryEngine) isBrokenPipe(err any) bool {
-	if err == nil {
-		return false
-	}
-	errObj, ok := err.(error)
-	if !ok {
-		s := strings.ToLower(fmt.Sprint(err))
-		return strings.Contains(s, "broken pipe") || strings.Contains(s, "connection reset by peer")
-	}
-
-	if errors.Is(errObj, io.EOF) || errors.Is(errObj, io.ErrClosedPipe) {
-		return true
-	}
-
-	var netOpErr *net.OpError
-	if errors.As(errObj, &netOpErr) {
-		var syscallErr *os.SyscallError
-		if errors.As(netOpErr.Err, &syscallErr) {
-			s := strings.ToLower(syscallErr.Error())
-			return strings.Contains(s, "broken pipe") || strings.Contains(s, "connection reset by peer")
-		}
-	}
-	return false
+		c.Abort()
+	})
 }
