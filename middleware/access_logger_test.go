@@ -79,7 +79,7 @@ func TestAccessRecordStartFields(t *testing.T) {
 func ExampleAccessLog() {
 	router := gin.New()
 	router.Use(middleware.AccessLog(middleware.AccessLogConfig{
-		Output: middleware.AccessLoggerFunc(func(_ context.Context, record middleware.AccessRecord) {
+		Logger: middleware.AccessLoggerFunc(func(_ context.Context, record middleware.AccessRecord) {
 			fmt.Println(record.Phase, record.Method, record.Route, record.Status)
 		}),
 		Default: middleware.AccessLogPolicy{Finish: true},

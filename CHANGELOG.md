@@ -1,5 +1,15 @@
 # Changelog
 
+## [v1.4.0] - 2026-11-05
+
+This release intentionally includes incompatible access-log API changes while retaining the v1 module path.
+
+- Unify log output under `Logger IAccessLogger`; remove the transitional `Output` field, direct slog logger configuration, and `GetLogger`.
+- Remove `Skip` and flat capture flags/limits; use `Default`, `Resolve`, and `ShouldLog` exclusively.
+- Make policy booleans explicit: an empty default or resolved policy disables all events and capture.
+- Use compact single-value headers by default, with multi-value headers preserved and `HeaderFormatMulti` available explicitly.
+- Update stream/redaction/concurrency regression tests, runnable examples, and upgrade instructions to the single configuration API.
+
 ## [v1.3.0] - 2026-11-05
 
 - Add backend-neutral access logging through `IAccessLogger`, `AccessLoggerFunc`, and a slog adapter.

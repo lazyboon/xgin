@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -60,13 +59,12 @@ func (p AccessLogPolicy) normalize() AccessLogPolicy {
 }
 
 // AccessLogConfig controls access records, payload capture and output.
-// Callbacks and Output must support concurrent calls. Gin callbacks must not
+// Callbacks and Logger must support concurrent calls. Gin callbacks must not
 // retain the context. Configuration slices are copied during construction.
 type AccessLogConfig struct {
-	// Output receives sanitized records. Nil uses the legacy slog settings.
-	Output IAccessLogger
-	// Default sets the base policy. Its zero value records both events without
-	// payloads, or uses the legacy capture settings below when supplied.
+	// Logger receives sanitized records. Nil uses slog.Default through an adapter.
+	Logger IAccessLogger
+	// Default sets the base policy. Its zero value disables logging and capture.
 	Default AccessLogPolicy
 	// Resolve receives a policy copy before handling the request. Match routes
 	// using both Request.Method and FullPath(); unmatched routes have an empty
@@ -76,48 +74,14 @@ type AccessLogConfig struct {
 	// completion-only condition cannot retroactively suppress a start event;
 	// disable Start for routes that should only log errors or slow requests.
 	ShouldLog func(AccessRecord) bool
-	// HeaderFormat defaults to HeaderFormatMulti to preserve existing logs.
+	// HeaderFormat defaults to HeaderFormatCompact.
 	HeaderFormat  HeaderFormat
 	RedactHeaders []string // Additional sensitive headers; built-in masks cannot be removed.
 	RedactKeys    []string // Additional JSON/form keys; matching ignores case, '_' and '-'.
-
-	// Logger is the fallback slog logger. Output takes precedence.
-	//
-	// Deprecated: use Output with NewSlogAccessLogger or a custom IAccessLogger.
-	Logger *slog.Logger
-	// GetLogger selects a request-scoped fallback slog logger. Nil results use Logger.
-	//
-	// Deprecated: use a custom IAccessLogger to select output from standard context.
-	GetLogger func(*gin.Context) *slog.Logger
-	// Skip bypasses all logging before Resolve is called.
-	//
-	// Deprecated: return an empty policy from Resolve instead.
-	Skip func(*gin.Context) bool
-	// RequestHeaders enables request header capture when Default is zero.
-	//
-	// Deprecated: use Default.Request and Default.Response.
-	RequestHeaders bool
-	// ResponseHeaders enables response header capture with the legacy policy.
-	//
-	// Deprecated: use Default.Response.Headers.
-	ResponseHeaders bool
-	// RequestBody enables request body capture with the legacy policy.
-	//
-	// Deprecated: use Default.Request.Body.
-	RequestBody bool
-	// ResponseBody enables response body capture with the legacy policy.
-	//
-	// Deprecated: use Default.Response.Body.
-	ResponseBody bool
-	// MaxBodyBytes sets both legacy capture limits; zero uses 4096 bytes.
-	//
-	// Deprecated: use Default.Request.MaxBodyBytes and Default.Response.MaxBodyBytes.
-	MaxBodyBytes int
 }
 
 type accessLogger struct {
 	config  AccessLogConfig
-	policy  AccessLogPolicy
 	headers map[string]bool
 	keys    map[string]bool
 }
@@ -126,31 +90,15 @@ type accessLogger struct {
 // Only complete JSON and URL-encoded bodies are logged. Query values are never
 // logged. Invalid static configuration panics during middleware construction.
 func AccessLog(config AccessLogConfig) gin.HandlerFunc {
-	policy := config.Default
-	if policy == (AccessLogPolicy{}) {
-		policy = AccessLogPolicy{
-			Start:  true,
-			Finish: true,
-			Request: AccessLogContent{
-				Headers: config.RequestHeaders, Body: config.RequestBody, MaxBodyBytes: config.MaxBodyBytes,
-			},
-			Response: AccessLogContent{
-				Headers: config.ResponseHeaders, Body: config.ResponseBody, MaxBodyBytes: config.MaxBodyBytes,
-			},
-		}
-	}
-	policy = policy.normalize()
+	config.Default = config.Default.normalize()
 	if config.HeaderFormat != HeaderFormatMulti && config.HeaderFormat != HeaderFormatCompact {
 		panic("xgin.middleware: invalid access log header format")
 	}
 	if config.Logger == nil {
-		config.Logger = slog.Default()
-	}
-	if config.Output == nil && config.GetLogger == nil {
-		config.Output = NewSlogAccessLogger(config.Logger)
+		config.Logger = NewSlogAccessLogger(nil)
 	}
 	logger := &accessLogger{
-		config: config, policy: policy,
+		config:  config,
 		headers: defaultRedactHeaders(), keys: defaultRedactKeys(),
 	}
 	for _, name := range config.RedactHeaders {
@@ -177,12 +125,8 @@ type IStackTracer interface {
 
 // handle applies a request-local policy and observes the final response.
 func (l *accessLogger) handle(c *gin.Context) {
-	if l.config.Skip != nil && l.config.Skip(c) {
-		c.Next()
-		return
-	}
 	startedAt := time.Now()
-	policy := l.policy
+	policy := l.config.Default
 	if l.config.Resolve != nil {
 		policy = l.config.Resolve(c, policy).normalize()
 	}
@@ -190,7 +134,6 @@ func (l *accessLogger) handle(c *gin.Context) {
 		c.Next()
 		return
 	}
-	output := l.output(c)
 	record := AccessRecord{
 		Phase: AccessStarted, Level: AccessLogInfo,
 		Method: c.Request.Method, Path: c.Request.URL.Path, Route: c.FullPath(),
@@ -205,7 +148,7 @@ func (l *accessLogger) handle(c *gin.Context) {
 		if policy.Request.Headers {
 			record.RequestHeaders = l.headersForLog(requestHeaders)
 		}
-		l.emit(c, output, record)
+		l.emit(c, record)
 	}
 
 	// Capture must be selected before the handler consumes the streams. Even
@@ -266,27 +209,13 @@ func (l *accessLogger) handle(c *gin.Context) {
 	case record.Status >= http.StatusBadRequest:
 		record.Level = AccessLogWarn
 	}
-	l.emit(c, output, record)
-}
-
-// output selects a single destination for both events of this request.
-func (l *accessLogger) output(c *gin.Context) IAccessLogger {
-	if l.config.Output != nil {
-		return l.config.Output
-	}
-	logger := l.config.Logger
-	if l.config.GetLogger != nil {
-		if selected := l.config.GetLogger(c); selected != nil {
-			logger = selected
-		}
-	}
-	return NewSlogAccessLogger(logger)
+	l.emit(c, record)
 }
 
 // emit passes only sanitized records to the predicate and output.
-func (l *accessLogger) emit(c *gin.Context, output IAccessLogger, record AccessRecord) {
+func (l *accessLogger) emit(c *gin.Context, record AccessRecord) {
 	if l.config.ShouldLog == nil || l.config.ShouldLog(record) {
-		output.Log(c.Request.Context(), record)
+		l.config.Logger.Log(c.Request.Context(), record)
 	}
 }
 

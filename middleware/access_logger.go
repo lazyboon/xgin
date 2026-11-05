@@ -10,8 +10,8 @@ import (
 type HeaderFormat uint
 
 const (
-	HeaderFormatMulti   HeaderFormat = iota // Every value remains a []string, including single values.
-	HeaderFormatCompact                     // Single values become strings; multiple values remain []string.
+	HeaderFormatCompact HeaderFormat = iota // Single values become strings; multiple values remain []string.
+	HeaderFormatMulti                       // Every value remains a []string, including single values.
 )
 
 // AccessPhase identifies the point in a request's lifecycle.

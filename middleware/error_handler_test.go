@@ -35,7 +35,10 @@ func (r testResponse) Render(c *gin.Context) error {
 func TestRecoveryAndErrorHandler(t *testing.T) {
 	logger, b := newLogger()
 	r := gin.New()
-	r.Use(middleware.RequestID(middleware.RequestIDConfig{}), middleware.AccessLog(middleware.AccessLogConfig{Logger: logger}), middleware.ErrorHandler(middleware.ErrorHandlerConfig{Respond: func(c *gin.Context, err error) xgin.IResponse {
+	r.Use(middleware.RequestID(middleware.RequestIDConfig{}), middleware.AccessLog(middleware.AccessLogConfig{
+		Logger:  middleware.NewSlogAccessLogger(logger),
+		Default: middleware.AccessLogPolicy{Start: true, Finish: true},
+	}), middleware.ErrorHandler(middleware.ErrorHandlerConfig{Respond: func(c *gin.Context, err error) xgin.IResponse {
 		if !strings.Contains(err.Error(), "panic private") {
 			t.Fatal(err)
 		}
