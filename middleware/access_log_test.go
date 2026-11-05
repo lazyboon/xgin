@@ -3,6 +3,7 @@ package middleware_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -360,5 +362,285 @@ func TestCaptureMixedWritesAtLimit(t *testing.T) {
 				t.Fatalf("capture=%q want=%q", got, want)
 			}
 		})
+	}
+}
+
+// recordBuffer retains snapshots to verify independence across requests/events.
+type recordBuffer struct {
+	sync.Mutex
+	records []middleware.AccessRecord
+}
+
+func (b *recordBuffer) Log(_ context.Context, record middleware.AccessRecord) {
+	b.Lock()
+	defer b.Unlock()
+	b.records = append(b.records, record)
+}
+
+func (b *recordBuffer) snapshot() []middleware.AccessRecord {
+	b.Lock()
+	defer b.Unlock()
+	return append([]middleware.AccessRecord(nil), b.records...)
+}
+
+func TestAccessLogRoutePolicies(t *testing.T) {
+	output := new(recordBuffer)
+	router := gin.New()
+	router.Use(middleware.AccessLog(middleware.AccessLogConfig{
+		Output:  output,
+		Default: middleware.AccessLogPolicy{Start: true, Finish: true},
+		Resolve: func(c *gin.Context, policy middleware.AccessLogPolicy) middleware.AccessLogPolicy {
+			switch c.FullPath() {
+			case "/health":
+				return middleware.AccessLogPolicy{}
+			case "/items/:id":
+				if c.Request.Method == http.MethodPost {
+					policy.Start = false
+					policy.Request.Body = true
+					policy.Response.Body = true
+				}
+			case "/start":
+				policy.Finish = false
+				policy.Request.Body = true
+				policy.Response.Body = true
+			}
+			return policy
+		},
+	}))
+	handler := func(c *gin.Context) {
+		_, _ = io.Copy(io.Discard, c.Request.Body)
+		c.JSON(200, gin.H{"safe": true})
+	}
+	router.GET("/health", handler)
+	router.GET("/items/:id", handler)
+	router.POST("/items/:id", handler)
+	router.POST("/start", func(c *gin.Context) {
+		if _, wrapped := c.Request.Body.(*trackedBody); !wrapped {
+			t.Error("start-only policy wrapped the request body")
+		}
+		handler(c)
+	})
+	paths := []string{"/health", "/items/1", "/items/2", "/start", "/missing"}
+	methods := []string{"GET", "GET", "POST", "POST", "GET"}
+	for i, path := range paths {
+		req := httptest.NewRequest(methods[i], path, nil)
+		req.Body = &trackedBody{reader: strings.NewReader(`{"safe":"request"}`)}
+		req.ContentLength = -1
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	records := output.snapshot()
+	if len(records) != 6 {
+		t.Fatalf("records=%d want=6", len(records))
+	}
+	if records[0].RequestBody != nil || records[1].ResponseBody != nil {
+		t.Fatal("method-specific policy leaked to GET")
+	}
+	post := records[2]
+	if post.Phase != middleware.AccessCompleted || post.Route != "/items/:id" ||
+		post.RequestBody == nil || post.ResponseBody == nil {
+		t.Fatalf("POST record=%+v", post)
+	}
+	if records[3].Phase != middleware.AccessStarted || records[3].RequestBody != nil {
+		t.Fatal("start-only policy captured a body")
+	}
+	if records[5].Route != "" || records[5].Status != 404 {
+		t.Fatalf("unmatched route=%+v", records[5])
+	}
+}
+
+func TestAccessLogCompletionFilter(t *testing.T) {
+	output := new(recordBuffer)
+	router := gin.New()
+	router.Use(middleware.AccessLog(middleware.AccessLogConfig{
+		Output: output,
+		Default: middleware.AccessLogPolicy{
+			Finish:   true,
+			Request:  middleware.AccessLogContent{Body: true},
+			Response: middleware.AccessLogContent{Body: true},
+		},
+		ShouldLog: func(record middleware.AccessRecord) bool {
+			// The predicate receives sanitized bodies, including for discarded events.
+			if record.RequestBody == nil || strings.Contains(*record.RequestBody, "hidden") {
+				t.Error("predicate received an unsafe or missing request body")
+			}
+			return record.Status >= 400 || record.Error != nil
+		},
+	}))
+	router.POST("/:kind", func(c *gin.Context) {
+		_, _ = io.Copy(io.Discard, c.Request.Body)
+		switch c.Param("kind") {
+		case "error":
+			c.JSON(400, gin.H{"password": "hidden"})
+		case "internal":
+			_ = c.Error(errors.New("failure"))
+			c.JSON(200, gin.H{})
+		default:
+			c.JSON(200, gin.H{})
+		}
+	})
+	for _, kind := range []string{"ok", "error", "internal"} {
+		req := httptest.NewRequest("POST", "/"+kind, strings.NewReader(`{"password":"hidden"}`))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	records := output.snapshot()
+	if len(records) != 2 || records[0].Level != middleware.AccessLogWarn ||
+		records[1].Level != middleware.AccessLogError || records[1].Error == nil {
+		t.Fatalf("filtered records=%+v", records)
+	}
+	if strings.Contains(*records[0].ResponseBody, "hidden") {
+		t.Fatal("output received an unredacted body")
+	}
+}
+
+func TestAccessLogCompactHeadersAndOutputPrecedence(t *testing.T) {
+	output := new(recordBuffer)
+	logger, buffer := newLogger()
+	router := gin.New()
+	router.Use(middleware.AccessLog(middleware.AccessLogConfig{
+		Output: output, Logger: logger,
+		GetLogger: func(*gin.Context) *slog.Logger {
+			t.Error("legacy logger selected despite Output")
+			return logger
+		},
+		HeaderFormat: middleware.HeaderFormatCompact,
+		Default: middleware.AccessLogPolicy{
+			Start: true, Finish: true,
+			Request:  middleware.AccessLogContent{Headers: true},
+			Response: middleware.AccessLogContent{Headers: true},
+		},
+	}))
+	router.GET("/", func(c *gin.Context) {
+		c.Header("Content-Type", "application/json")
+		c.Writer.Header().Add("X-Multi", "first")
+		c.Writer.Header().Add("X-Multi", "second")
+		c.Header("Set-Cookie", "secret")
+		c.Status(204)
+	})
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Single", "one")
+	req.Header.Set("Authorization", "secret")
+	router.ServeHTTP(httptest.NewRecorder(), req)
+	records := output.snapshot()
+	if buffer.snapshot() != "" || len(records) != 2 {
+		t.Fatal("multiple outputs selected")
+	}
+	first, second := records[0], records[1]
+	if first.RequestHeaders["X-Single"] != "one" || second.ResponseHeaders["Set-Cookie"] != "[REDACTED]" {
+		t.Fatalf("compact headers=%v %v", first.RequestHeaders, second.ResponseHeaders)
+	}
+	values, ok := second.ResponseHeaders["X-Multi"].([]string)
+	if !ok || len(values) != 2 {
+		t.Fatal("multiple header values were flattened")
+	}
+	first.RequestHeaders["X-Single"] = "changed"
+	if second.RequestHeaders["X-Single"] != "one" || req.Header.Get("Authorization") != "secret" {
+		t.Fatal("event or request headers were aliased")
+	}
+}
+
+func TestAccessLogIndependentCaptureLimits(t *testing.T) {
+	output := new(recordBuffer)
+	router := gin.New()
+	router.Use(middleware.AccessLog(middleware.AccessLogConfig{
+		Output: output,
+		Default: middleware.AccessLogPolicy{
+			Finish:   true,
+			Request:  middleware.AccessLogContent{Body: true, MaxBodyBytes: 8},
+			Response: middleware.AccessLogContent{Body: true, MaxBodyBytes: 128},
+		},
+	}))
+	router.POST("/", func(c *gin.Context) {
+		_, _ = io.Copy(io.Discard, c.Request.Body)
+		c.JSON(200, gin.H{"safe": "response"})
+	})
+	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"safe":"request"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(httptest.NewRecorder(), req)
+	record := output.snapshot()[0]
+	if *record.RequestBody != "[omitted: body exceeds log limit]" ||
+		!strings.Contains(*record.ResponseBody, "response") {
+		t.Fatalf("independent capture=%+v", record)
+	}
+}
+
+func TestAccessLogNewConfigurationValidation(t *testing.T) {
+	cases := []middleware.AccessLogConfig{
+		{HeaderFormat: middleware.HeaderFormat(99)},
+		{Default: middleware.AccessLogPolicy{Finish: true, Request: middleware.AccessLogContent{MaxBodyBytes: -1}}},
+		{Default: middleware.AccessLogPolicy{Finish: true, Response: middleware.AccessLogContent{MaxBodyBytes: 1<<20 + 1}}},
+		{RedactKeys: []string{"_-"}},
+	}
+	for i, config := range cases {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("invalid config accepted")
+				}
+			}()
+			middleware.AccessLog(config)
+		})
+	}
+}
+
+func TestAccessLogConcurrentPolicyIsolation(t *testing.T) {
+	output := new(recordBuffer)
+	router := gin.New()
+	router.Use(middleware.AccessLog(middleware.AccessLogConfig{
+		Output:  output,
+		Default: middleware.AccessLogPolicy{Finish: true},
+		Resolve: func(c *gin.Context, policy middleware.AccessLogPolicy) middleware.AccessLogPolicy {
+			policy.Response.Body = c.Param("id") == "capture"
+			return policy
+		},
+	}))
+	router.GET("/:id", func(c *gin.Context) { c.JSON(200, gin.H{"safe": true}) })
+	var group sync.WaitGroup
+	for range 20 {
+		for _, path := range []string{"/capture", "/omit"} {
+			group.Go(func() {
+				router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+			})
+		}
+	}
+	group.Wait()
+	records := output.snapshot()
+	if len(records) != 40 {
+		t.Fatalf("records=%d", len(records))
+	}
+	for _, record := range records {
+		if (record.ResponseBody != nil) != (record.Path == "/capture") {
+			t.Fatalf("policy crossed requests: %+v", record)
+		}
+	}
+}
+
+func TestAccessLogLegacyLoggerSelectionAndSkipPrecedence(t *testing.T) {
+	fallback, fallbackBuffer := newLogger()
+	selected, selectedBuffer := newLogger()
+	router := gin.New()
+	router.Use(middleware.AccessLog(middleware.AccessLogConfig{
+		Logger: fallback,
+		GetLogger: func(c *gin.Context) *slog.Logger {
+			if c.Param("id") == "selected" {
+				return selected
+			}
+			return nil
+		},
+		Skip: func(c *gin.Context) bool { return c.Param("id") == "skip" },
+		Resolve: func(c *gin.Context, policy middleware.AccessLogPolicy) middleware.AccessLogPolicy {
+			if c.Param("id") == "skip" {
+				t.Error("Resolve called on skipped request")
+			}
+			return policy
+		},
+	}))
+	router.GET("/:id", func(c *gin.Context) { c.Status(204) })
+	for _, path := range []string{"/fallback", "/selected", "/skip"} {
+		router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+	}
+	if len(entries(t, fallbackBuffer)) != 2 || len(entries(t, selectedBuffer)) != 2 {
+		t.Fatal("legacy logger selection changed")
 	}
 }

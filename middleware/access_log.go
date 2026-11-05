@@ -23,46 +23,135 @@ const (
 	maxLogBodyBytes     = 1 << 20
 )
 
-// AccessLogConfig controls structured request logs and optional bounded payload capture.
-// Callbacks must support concurrent calls and must not retain the Gin context.
-// Only complete JSON and URL-encoded forms are logged; other payloads are omitted.
+// AccessLogContent controls optional headers and bounded body capture.
+// A zero MaxBodyBytes uses 4096 bytes; the maximum is 1 MiB.
+type AccessLogContent struct {
+	Headers      bool
+	Body         bool
+	MaxBodyBytes int
+}
+
+// normalize bounds capture memory independently for each payload direction.
+func (c AccessLogContent) normalize() AccessLogContent {
+	if c.MaxBodyBytes == 0 {
+		c.MaxBodyBytes = defaultLogBodyBytes
+	}
+	if c.MaxBodyBytes < 1 || c.MaxBodyBytes > maxLogBodyBytes {
+		panic("xgin.middleware: log body limit must be between 1 and 1048576")
+	}
+	return c
+}
+
+// AccessLogPolicy controls the events and payloads recorded for one request.
+// Bodies are only included in completion events. With Finish disabled, body
+// capture is disabled even if Body is true. An empty resolved policy skips logging.
+type AccessLogPolicy struct {
+	Start    bool
+	Finish   bool
+	Request  AccessLogContent
+	Response AccessLogContent
+}
+
+// normalize validates capture limits and fills in their defaults.
+func (p AccessLogPolicy) normalize() AccessLogPolicy {
+	p.Request = p.Request.normalize()
+	p.Response = p.Response.normalize()
+	return p
+}
+
+// AccessLogConfig controls access records, payload capture and output.
+// Callbacks and Output must support concurrent calls. Gin callbacks must not
+// retain the context. Configuration slices are copied during construction.
 type AccessLogConfig struct {
-	Logger          *slog.Logger
-	GetLogger       func(*gin.Context) *slog.Logger // Non-nil results take precedence over Logger.
-	Skip            func(*gin.Context) bool
-	RequestHeaders  bool
+	// Output receives sanitized records. Nil uses the legacy slog settings.
+	Output IAccessLogger
+	// Default sets the base policy. Its zero value records both events without
+	// payloads, or uses the legacy capture settings below when supplied.
+	Default AccessLogPolicy
+	// Resolve receives a policy copy before handling the request. Match routes
+	// using both Request.Method and FullPath(); unmatched routes have an empty
+	// FullPath(). Returned policies must contain valid capture limits.
+	Resolve func(*gin.Context, AccessLogPolicy) AccessLogPolicy
+	// ShouldLog filters each sanitized event immediately before output. A
+	// completion-only condition cannot retroactively suppress a start event;
+	// disable Start for routes that should only log errors or slow requests.
+	ShouldLog func(AccessRecord) bool
+	// HeaderFormat defaults to HeaderFormatMulti to preserve existing logs.
+	HeaderFormat  HeaderFormat
+	RedactHeaders []string // Additional sensitive headers; built-in masks cannot be removed.
+	RedactKeys    []string // Additional JSON/form keys; matching ignores case, '_' and '-'.
+
+	// Logger is the fallback slog logger. Output takes precedence.
+	//
+	// Deprecated: use Output with NewSlogAccessLogger or a custom IAccessLogger.
+	Logger *slog.Logger
+	// GetLogger selects a request-scoped fallback slog logger. Nil results use Logger.
+	//
+	// Deprecated: use a custom IAccessLogger to select output from standard context.
+	GetLogger func(*gin.Context) *slog.Logger
+	// Skip bypasses all logging before Resolve is called.
+	//
+	// Deprecated: return an empty policy from Resolve instead.
+	Skip func(*gin.Context) bool
+	// RequestHeaders enables request header capture when Default is zero.
+	//
+	// Deprecated: use Default.Request and Default.Response.
+	RequestHeaders bool
+	// ResponseHeaders enables response header capture with the legacy policy.
+	//
+	// Deprecated: use Default.Response.Headers.
 	ResponseHeaders bool
-	RequestBody     bool
-	ResponseBody    bool
-	MaxBodyBytes    int      // Zero uses 4096; the allowed range is 1 through 1 MiB.
-	RedactHeaders   []string // Additional sensitive header names; defaults cannot be removed.
-	RedactKeys      []string // Additional sensitive JSON/form keys; matching ignores case, '_' and '-'.
+	// RequestBody enables request body capture with the legacy policy.
+	//
+	// Deprecated: use Default.Request.Body.
+	RequestBody bool
+	// ResponseBody enables response body capture with the legacy policy.
+	//
+	// Deprecated: use Default.Response.Body.
+	ResponseBody bool
+	// MaxBodyBytes sets both legacy capture limits; zero uses 4096 bytes.
+	//
+	// Deprecated: use Default.Request.MaxBodyBytes and Default.Response.MaxBodyBytes.
+	MaxBodyBytes int
 }
 
 type accessLogger struct {
 	config  AccessLogConfig
+	policy  AccessLogPolicy
 	headers map[string]bool
 	keys    map[string]bool
 }
 
-// AccessLog records request start and completion using slog.
-// Header and body capture are disabled by default. URLs include only the path, never the query.
-// Request bodies are observed as the application reads them; logging never reads ahead.
-// Invalid limits or redaction names panic during construction. Configuration slices are copied.
+// AccessLog observes request start and completion without reading ahead.
+// Only complete JSON and URL-encoded bodies are logged. Query values are never
+// logged. Invalid static configuration panics during middleware construction.
 func AccessLog(config AccessLogConfig) gin.HandlerFunc {
-	if config.MaxBodyBytes == 0 {
-		config.MaxBodyBytes = defaultLogBodyBytes
+	policy := config.Default
+	if policy == (AccessLogPolicy{}) {
+		policy = AccessLogPolicy{
+			Start:  true,
+			Finish: true,
+			Request: AccessLogContent{
+				Headers: config.RequestHeaders, Body: config.RequestBody, MaxBodyBytes: config.MaxBodyBytes,
+			},
+			Response: AccessLogContent{
+				Headers: config.ResponseHeaders, Body: config.ResponseBody, MaxBodyBytes: config.MaxBodyBytes,
+			},
+		}
 	}
-	if config.MaxBodyBytes < 1 || config.MaxBodyBytes > maxLogBodyBytes {
-		panic("xgin.middleware: log body limit must be between 1 and 1048576")
+	policy = policy.normalize()
+	if config.HeaderFormat != HeaderFormatMulti && config.HeaderFormat != HeaderFormatCompact {
+		panic("xgin.middleware: invalid access log header format")
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
+	if config.Output == nil && config.GetLogger == nil {
+		config.Output = NewSlogAccessLogger(config.Logger)
+	}
 	logger := &accessLogger{
-		config:  config,
-		headers: defaultRedactHeaders(),
-		keys:    defaultRedactKeys(),
+		config: config, policy: policy,
+		headers: defaultRedactHeaders(), keys: defaultRedactKeys(),
 	}
 	for _, name := range config.RedactHeaders {
 		if !httpguts.ValidHeaderFieldName(name) {
@@ -71,7 +160,7 @@ func AccessLog(config AccessLogConfig) gin.HandlerFunc {
 		logger.headers[strings.ToLower(name)] = true
 	}
 	for _, key := range config.RedactKeys {
-		if key == "" {
+		if normalizeRedactKey(key) == "" {
 			panic("xgin.middleware: sensitive body key cannot be empty")
 		}
 		logger.keys[normalizeRedactKey(key)] = true
@@ -81,96 +170,138 @@ func AccessLog(config AccessLogConfig) gin.HandlerFunc {
 	return logger.handle
 }
 
-// IStackTracer exposes diagnostic stacks without depending on a particular error type.
+// IStackTracer exposes diagnostic stacks without depending on an error package.
 type IStackTracer interface {
 	StackTrace() string
 }
 
-// handle observes the request lifecycle without changing payload consumption.
+// handle applies a request-local policy and observes the final response.
 func (l *accessLogger) handle(c *gin.Context) {
 	if l.config.Skip != nil && l.config.Skip(c) {
 		c.Next()
 		return
 	}
 	startedAt := time.Now()
+	policy := l.policy
+	if l.config.Resolve != nil {
+		policy = l.config.Resolve(c, policy).normalize()
+	}
+	if !policy.Start && !policy.Finish {
+		c.Next()
+		return
+	}
+	output := l.output(c)
+	record := AccessRecord{
+		Phase: AccessStarted, Level: AccessLogInfo,
+		Method: c.Request.Method, Path: c.Request.URL.Path, Route: c.FullPath(),
+		RequestID: RequestIDFromContext(c.Request.Context()),
+	}
+	var requestHeaders http.Header
+	if policy.Request.Headers || policy.Finish && policy.Request.Body {
+		requestHeaders = c.Request.Header.Clone()
+	}
+	requestLength := c.Request.ContentLength
+	if policy.Start {
+		if policy.Request.Headers {
+			record.RequestHeaders = l.headersForLog(requestHeaders)
+		}
+		l.emit(c, output, record)
+	}
+
+	// Capture must be selected before the handler consumes the streams. Even
+	// completion filters such as "errors only" need this bounded observation.
+	var requestCapture *bodyCapture
+	if policy.Finish && policy.Request.Body && c.Request.Body != nil && capturableBody(requestHeaders) {
+		requestCapture = &bodyCapture{limit: policy.Request.MaxBodyBytes}
+		c.Request.Body = &captureReadCloser{ReadCloser: c.Request.Body, capture: requestCapture}
+	}
+	var responseCapture *captureWriter
+	if policy.Finish && policy.Response.Body {
+		responseCapture = &captureWriter{
+			ResponseWriter: c.Writer,
+			capture:        bodyCapture{limit: policy.Response.MaxBodyBytes},
+		}
+		c.Writer = responseCapture
+	}
+	c.Next()
+	if !policy.Finish {
+		return
+	}
+
+	// Create detached headers for each event: a custom output may retain or
+	// modify its record without changing the response or the next event.
+	record.Phase = AccessCompleted
+	record.Duration = time.Since(startedAt)
+	record.Status = c.Writer.Status()
+	if policy.Request.Headers {
+		record.RequestHeaders = l.headersForLog(requestHeaders)
+	}
+	if policy.Request.Body {
+		complete := requestCapture != nil && (requestCapture.eof ||
+			requestLength >= 0 && requestCapture.total == requestLength)
+		body := l.bodyForLog(requestCapture, requestHeaders, complete)
+		record.RequestBody = &body
+	}
+	if policy.Response.Headers {
+		record.ResponseHeaders = l.headersForLog(c.Writer.Header())
+	}
+	if responseCapture != nil {
+		body := l.bodyForLog(&responseCapture.capture, c.Writer.Header(), true)
+		record.ResponseBody = &body
+	}
+	causes := make([]error, 0, len(c.Errors))
+	for _, cause := range c.Errors {
+		causes = append(causes, cause.Err)
+		var tracer IStackTracer
+		if errors.As(cause.Err, &tracer) {
+			record.Stacks = append(record.Stacks, tracer.StackTrace())
+		} else if stack, ok := cause.Meta.(string); ok {
+			record.Stacks = append(record.Stacks, stack)
+		}
+	}
+	record.Error = errors.Join(causes...)
+	switch {
+	case record.Status >= http.StatusInternalServerError || record.Error != nil:
+		record.Level = AccessLogError
+	case record.Status >= http.StatusBadRequest:
+		record.Level = AccessLogWarn
+	}
+	l.emit(c, output, record)
+}
+
+// output selects a single destination for both events of this request.
+func (l *accessLogger) output(c *gin.Context) IAccessLogger {
+	if l.config.Output != nil {
+		return l.config.Output
+	}
 	logger := l.config.Logger
 	if l.config.GetLogger != nil {
 		if selected := l.config.GetLogger(c); selected != nil {
 			logger = selected
 		}
 	}
-	method, path := c.Request.Method, c.Request.URL.Path
-	var requestHeaders http.Header
-	if l.config.RequestHeaders || l.config.RequestBody {
-		requestHeaders = c.Request.Header.Clone()
-	}
-	requestLength := c.Request.ContentLength
-	attrs := []slog.Attr{
-		slog.String("method", method),
-		slog.String("path", path),
-		slog.String("request_id", RequestIDFromContext(c.Request.Context())),
-	}
-	if l.config.RequestHeaders {
-		attrs = append(attrs, slog.Any("request_headers", l.redactHeaders(requestHeaders)))
-	}
-	logger.LogAttrs(c.Request.Context(), slog.LevelInfo, "http request started", attrs...)
+	return NewSlogAccessLogger(logger)
+}
 
-	var requestCapture *bodyCapture
-	if l.config.RequestBody && c.Request.Body != nil && capturableBody(requestHeaders) {
-		requestCapture = &bodyCapture{limit: l.config.MaxBodyBytes}
-		c.Request.Body = &captureReadCloser{ReadCloser: c.Request.Body, capture: requestCapture}
+// emit passes only sanitized records to the predicate and output.
+func (l *accessLogger) emit(c *gin.Context, output IAccessLogger, record AccessRecord) {
+	if l.config.ShouldLog == nil || l.config.ShouldLog(record) {
+		output.Log(c.Request.Context(), record)
 	}
-	var responseCapture *captureWriter
-	if l.config.ResponseBody {
-		responseCapture = &captureWriter{
-			ResponseWriter: c.Writer,
-			capture:        bodyCapture{limit: l.config.MaxBodyBytes},
+}
+
+// headersForLog preserves multi-value semantics and optionally compacts single values.
+func (l *accessLogger) headersForLog(headers http.Header) map[string]any {
+	sanitized := l.redactHeaders(headers)
+	result := make(map[string]any, len(sanitized))
+	for name, values := range sanitized {
+		if l.config.HeaderFormat == HeaderFormatCompact && len(values) == 1 {
+			result[name] = values[0]
+			continue
 		}
-		c.Writer = responseCapture
+		result[name] = values
 	}
-
-	c.Next()
-
-	status := c.Writer.Status()
-	attrs = append(attrs,
-		slog.String("route", c.FullPath()),
-		slog.Int("status", status),
-		slog.Float64("duration_ms", float64(time.Since(startedAt))/float64(time.Millisecond)),
-	)
-	if l.config.RequestBody {
-		complete := requestCapture != nil && (requestCapture.eof || requestLength >= 0 && requestCapture.total == requestLength)
-		attrs = append(attrs, slog.String("request_body", l.bodyForLog(requestCapture, requestHeaders, complete)))
-	}
-	if l.config.ResponseHeaders {
-		attrs = append(attrs, slog.Any("response_headers", l.redactHeaders(c.Writer.Header())))
-	}
-	if responseCapture != nil {
-		attrs = append(attrs, slog.String("response_body", l.bodyForLog(&responseCapture.capture, c.Writer.Header(), true)))
-	}
-	causes := make([]error, 0, len(c.Errors))
-	var stacks []string
-	for _, cause := range c.Errors {
-		causes = append(causes, cause.Err)
-		var tracer IStackTracer
-		if errors.As(cause.Err, &tracer) {
-			stacks = append(stacks, tracer.StackTrace())
-		} else if stack, ok := cause.Meta.(string); ok {
-			stacks = append(stacks, stack)
-		}
-	}
-	if len(causes) > 0 {
-		attrs = append(attrs, slog.Any("error", errors.Join(causes...)))
-	}
-	if len(stacks) > 0 {
-		attrs = append(attrs, slog.Any("stack", stacks))
-	}
-	level := slog.LevelInfo
-	if status >= http.StatusInternalServerError || len(causes) > 0 {
-		level = slog.LevelError
-	} else if status >= http.StatusBadRequest {
-		level = slog.LevelWarn
-	}
-	logger.LogAttrs(c.Request.Context(), level, "http request completed", attrs...)
+	return result
 }
 
 // redactHeaders returns a detached, sanitized header snapshot.
@@ -209,7 +340,7 @@ func (l *accessLogger) bodyForLog(capture *bodyCapture, headers http.Header, com
 				values[key] = []string{"[REDACTED]"}
 			}
 		}
-		return l.boundedBody(values.Encode())
+		return l.boundedBody(values.Encode(), capture.limit)
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(capture.data))
@@ -227,12 +358,12 @@ func (l *accessLogger) bodyForLog(capture *bodyCapture, headers http.Header, com
 	if err != nil {
 		return "[omitted: invalid json]"
 	}
-	return l.boundedBody(string(encoded))
+	return l.boundedBody(string(encoded), capture.limit)
 }
 
 // boundedBody also bounds output expanded by encoding or redaction.
-func (l *accessLogger) boundedBody(body string) string {
-	if len(body) > l.config.MaxBodyBytes {
+func (l *accessLogger) boundedBody(body string, limit int) string {
+	if len(body) > limit {
 		return "[omitted: redacted body exceeds log limit]"
 	}
 	return body
