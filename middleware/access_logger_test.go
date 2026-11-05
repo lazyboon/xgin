@@ -34,7 +34,7 @@ func TestSlogAccessLogger(t *testing.T) {
 				Phase: middleware.AccessCompleted, Level: tc.level,
 				Method: "POST", Path: "/items/1", Route: "/items/:id", RequestID: "request-1",
 				Status: 400, Duration: 1500 * time.Microsecond,
-				RequestBody: &body, Error: errors.New("internal failure"), Stacks: []string{"stack"},
+				RequestBody: body, Error: errors.New("internal failure"), Stacks: []string{"stack"},
 			}
 			middleware.NewSlogAccessLogger(logger).Log(context.Background(), record)
 			events := entries(t, buffer)

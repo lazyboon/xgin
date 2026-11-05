@@ -33,7 +33,8 @@ const (
 
 // AccessRecord is a sanitized snapshot passed to filters and logging backends.
 // Status, Duration, response fields, errors and bodies are only set on completion.
-// Header values follow HeaderFormat. A nil body means capture was not enabled;
+// Header values follow HeaderFormat. Bodies contain json.RawMessage for
+// structured JSON, strings for text/forms/omission markers, or nil when disabled;
 // an omitted-body marker explains why enabled capture could not safely log data.
 // Backends may retain records, but must not mutate errors supplied by the handler.
 // Error messages and stacks are diagnostics and may contain application secrets.
@@ -48,8 +49,8 @@ type AccessRecord struct {
 	Duration        time.Duration
 	RequestHeaders  map[string]any
 	ResponseHeaders map[string]any
-	RequestBody     *string
-	ResponseBody    *string
+	RequestBody     any
+	ResponseBody    any
 	Error           error
 	Stacks          []string
 }
@@ -83,10 +84,10 @@ func (r AccessRecord) Fields() map[string]any {
 		fields["response_headers"] = r.ResponseHeaders
 	}
 	if r.RequestBody != nil {
-		fields["request_body"] = *r.RequestBody
+		fields["request_body"] = r.RequestBody
 	}
 	if r.ResponseBody != nil {
-		fields["response_body"] = *r.ResponseBody
+		fields["response_body"] = r.ResponseBody
 	}
 	if r.Error != nil {
 		fields["error"] = r.Error.Error()

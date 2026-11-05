@@ -22,16 +22,50 @@ const (
 	maxLogBodyBytes     = 1 << 20
 )
 
+// RequestBodyMode controls when request payload bytes are observed.
+type RequestBodyMode string
+
+const (
+	RequestBodyPassive  RequestBodyMode = "Passive"  // Observe only bytes consumed by the handler.
+	RequestBodyBuffered RequestBodyMode = "Buffered" // Read a bounded prefix before the handler and replay it.
+)
+
+// BodyFormat controls the representation of complete, sanitized JSON payloads.
+type BodyFormat string
+
+const (
+	BodyFormatStructured BodyFormat = "Structured" // Embed the JSON value in structured logs.
+	BodyFormatText       BodyFormat = "Text"       // Encode sanitized JSON as a string.
+)
+
 // AccessLogContent controls optional headers and bounded body capture.
 // A zero MaxBodyBytes uses 4096 bytes; the maximum is 1 MiB.
 type AccessLogContent struct {
 	Headers      bool
 	Body         bool
 	MaxBodyBytes int
+	// BodyMode applies only to requests. Zero selects RequestBodyPassive;
+	// response bodies are always observed as the handler writes them.
+	BodyMode RequestBodyMode
+	// BodyFormat defaults to BodyFormatStructured. Form bodies and omission
+	// markers remain strings in either format.
+	BodyFormat BodyFormat
 }
 
 // normalize bounds capture memory independently for each payload direction.
 func (c AccessLogContent) normalize() AccessLogContent {
+	if c.BodyFormat == "" {
+		c.BodyFormat = BodyFormatStructured
+	}
+	if c.BodyFormat != BodyFormatStructured && c.BodyFormat != BodyFormatText {
+		panic("xgin.middleware: invalid log body format")
+	}
+	if c.BodyMode == "" {
+		c.BodyMode = RequestBodyPassive
+	}
+	if c.BodyMode != RequestBodyPassive && c.BodyMode != RequestBodyBuffered {
+		panic("xgin.middleware: invalid request body capture mode")
+	}
 	if c.MaxBodyBytes == 0 {
 		c.MaxBodyBytes = defaultLogBodyBytes
 	}
@@ -86,9 +120,10 @@ type accessLogger struct {
 	keys    map[string]bool
 }
 
-// AccessLog observes request start and completion without reading ahead.
+// AccessLog observes request start and completion with bounded payload capture.
 // Only complete JSON and URL-encoded bodies are logged. Query values are never
-// logged. Invalid static configuration panics during middleware construction.
+// logged. RequestBodyBuffered reads ahead only when completion body capture is
+// enabled. Invalid static configuration panics during middleware construction.
 func AccessLog(config AccessLogConfig) gin.HandlerFunc {
 	config.Default = config.Default.normalize()
 	if config.HeaderFormat != HeaderFormatMulti && config.HeaderFormat != HeaderFormatCompact {
@@ -154,9 +189,8 @@ func (l *accessLogger) handle(c *gin.Context) {
 	// Capture must be selected before the handler consumes the streams. Even
 	// completion filters such as "errors only" need this bounded observation.
 	var requestCapture *bodyCapture
-	if policy.Finish && policy.Request.Body && c.Request.Body != nil && capturableBody(requestHeaders) {
-		requestCapture = &bodyCapture{limit: policy.Request.MaxBodyBytes}
-		c.Request.Body = &captureReadCloser{ReadCloser: c.Request.Body, capture: requestCapture}
+	if policy.Finish {
+		requestCapture = l.captureRequest(c, policy.Request, requestHeaders)
 	}
 	var responseCapture *captureWriter
 	if policy.Finish && policy.Response.Body {
@@ -182,15 +216,23 @@ func (l *accessLogger) handle(c *gin.Context) {
 	if policy.Request.Body {
 		complete := requestCapture != nil && (requestCapture.eof ||
 			requestLength >= 0 && requestCapture.total == requestLength)
-		body := l.bodyForLog(requestCapture, requestHeaders, complete)
-		record.RequestBody = &body
+		record.RequestBody = l.bodyForLog(
+			requestCapture,
+			requestHeaders,
+			complete,
+			policy.Request.BodyFormat,
+		)
 	}
 	if policy.Response.Headers {
 		record.ResponseHeaders = l.headersForLog(c.Writer.Header())
 	}
 	if responseCapture != nil {
-		body := l.bodyForLog(&responseCapture.capture, c.Writer.Header(), true)
-		record.ResponseBody = &body
+		record.ResponseBody = l.bodyForLog(
+			&responseCapture.capture,
+			c.Writer.Header(),
+			true,
+			policy.Response.BodyFormat,
+		)
 	}
 	causes := make([]error, 0, len(c.Errors))
 	for _, cause := range c.Errors {
@@ -210,6 +252,53 @@ func (l *accessLogger) handle(c *gin.Context) {
 		record.Level = AccessLogWarn
 	}
 	l.emit(c, record)
+}
+
+// captureRequest installs passive observation or bounded read-ahead without
+// changing ContentLength, GetBody, Close behavior, or the remaining payload.
+func (l *accessLogger) captureRequest(
+	c *gin.Context,
+	content AccessLogContent,
+	headers http.Header,
+) *bodyCapture {
+	if !content.Body || c.Request.Body == nil || !capturableBody(headers) {
+		return nil
+	}
+	capture := &bodyCapture{limit: content.MaxBodyBytes}
+	if content.BodyMode == RequestBodyPassive {
+		c.Request.Body = &captureReadCloser{ReadCloser: c.Request.Body, capture: capture}
+		return capture
+	}
+
+	// A declared oversized body is never read ahead. Unknown lengths need one
+	// extra byte to distinguish an exact-limit body from an oversized prefix.
+	if c.Request.ContentLength > int64(content.MaxBodyBytes) {
+		capture.truncated = true
+		return capture
+	}
+	original := c.Request.Body
+	prefix, err := io.ReadAll(io.LimitReader(original, int64(content.MaxBodyBytes)+1))
+	capture.total = int64(len(prefix))
+	capture.truncated = len(prefix) > content.MaxBodyBytes
+	capture.failed = err != nil
+	capture.eof = err == nil && !capture.truncated
+	if !capture.truncated {
+		capture.data = prefix
+	}
+
+	// io.ReadAll consumes the terminal error. Replay it after the buffered
+	// bytes, then let subsequent reads continue on the original stream. Logging
+	// neither turns a transport failure into success nor rejects the request.
+	pending := err
+	if capture.eof {
+		pending = io.EOF
+	}
+	c.Request.Body = &replayReadCloser{
+		ReadCloser: original,
+		prefix:     bytes.NewReader(prefix),
+		pending:    pending,
+	}
+	return capture
 }
 
 // emit passes only sanitized records to the predicate and output.
@@ -245,14 +334,25 @@ func (l *accessLogger) redactHeaders(headers http.Header) http.Header {
 }
 
 // bodyForLog emits only complete supported bodies after structured redaction.
-func (l *accessLogger) bodyForLog(capture *bodyCapture, headers http.Header, complete bool) string {
+func (l *accessLogger) bodyForLog(
+	capture *bodyCapture,
+	headers http.Header,
+	complete bool,
+	format BodyFormat,
+) any {
 	if capture == nil || capture.disabled || !capturableBody(headers) {
 		return "[omitted: unsupported payload]"
 	}
 	if capture.truncated {
 		return "[omitted: body exceeds log limit]"
 	}
-	if capture.failed || !complete {
+	if capture.failed {
+		return "[omitted: body capture failed]"
+	}
+	if !complete {
+		if capture.total == 0 {
+			return "[omitted: body not read]"
+		}
 		return "[omitted: incomplete body]"
 	}
 	if len(capture.data) == 0 {
@@ -287,7 +387,15 @@ func (l *accessLogger) bodyForLog(capture *bodyCapture, headers http.Header, com
 	if err != nil {
 		return "[omitted: invalid json]"
 	}
-	return l.boundedBody(string(encoded), capture.limit)
+	if len(encoded) > capture.limit {
+		return "[omitted: redacted body exceeds log limit]"
+	}
+	if format == BodyFormatText {
+		return string(encoded)
+	}
+	// RawMessage keeps objects, arrays, scalars, and explicit null as JSON
+	// values. Only freshly encoded, fully redacted bytes reach this branch.
+	return json.RawMessage(encoded)
 }
 
 // boundedBody also bounds output expanded by encoding or redaction.
@@ -369,6 +477,30 @@ func (r *captureReadCloser) Read(data []byte) (int, error) {
 		r.capture.failed = true
 	}
 	return n, err
+}
+
+// replayReadCloser restores read-ahead bytes and a consumed terminal error.
+// Close is forwarded to the original body through the embedded ReadCloser.
+type replayReadCloser struct {
+	io.ReadCloser
+	prefix  *bytes.Reader
+	pending error
+}
+
+// Read drains the prefix before exposing the saved error and original stream.
+func (r *replayReadCloser) Read(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if r.prefix.Len() > 0 {
+		return r.prefix.Read(data)
+	}
+	if r.pending != nil {
+		err := r.pending
+		r.pending = nil
+		return 0, err
+	}
+	return r.ReadCloser.Read(data)
 }
 
 // captureWriter observes successful writes and preserves Gin transport behavior.

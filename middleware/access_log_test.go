@@ -58,13 +58,19 @@ func entries(t *testing.T, b *logBuffer) []map[string]any {
 }
 
 type trackedBody struct {
-	reader   io.Reader
-	reads    int
-	closed   bool
-	closeErr error
+	reader    io.Reader
+	reads     int
+	bytesRead int
+	closed    bool
+	closeErr  error
 }
 
-func (r *trackedBody) Read(p []byte) (int, error) { r.reads++; return r.reader.Read(p) }
+func (r *trackedBody) Read(p []byte) (int, error) {
+	r.reads++
+	n, err := r.reader.Read(p)
+	r.bytesRead += n
+	return n, err
+}
 
 func (r *trackedBody) Close() error { r.closed = true; return r.closeErr }
 
@@ -160,7 +166,8 @@ func TestStructuredCaptureAndRedaction(t *testing.T) {
 	if len(items) != 2 || items[0]["msg"] != "http request started" || items[1]["msg"] != "http request completed" {
 		t.Fatalf("events: %v", items)
 	}
-	if !strings.Contains(items[1]["response_body"].(string), `"safe":42`) || !strings.Contains(items[1]["request_body"].(string), `"safe":"yes"`) {
+	if items[1]["response_body"].(map[string]any)["safe"] != float64(42) ||
+		items[1]["request_body"].(map[string]any)["safe"] != "yes" {
 		t.Fatalf("payload missing: %v", items)
 	}
 	if !strings.Contains(w.Body.String(), "secretresponse") {
@@ -381,7 +388,7 @@ func TestCaptureMixedWritesAtLimit(t *testing.T) {
 				Logger: middleware.NewSlogAccessLogger(logger),
 				Default: middleware.AccessLogPolicy{
 					Start: true, Finish: true,
-					Response: middleware.AccessLogContent{Body: true, MaxBodyBytes: limit},
+					Response: middleware.AccessLogContent{Body: true, MaxBodyBytes: limit, BodyFormat: middleware.BodyFormatText},
 				},
 			}))
 			router.GET("/", func(c *gin.Context) {
@@ -514,7 +521,7 @@ func TestAccessLogCompletionFilter(t *testing.T) {
 		},
 		ShouldLog: func(record middleware.AccessRecord) bool {
 			// The predicate receives sanitized bodies, including for discarded events.
-			if record.RequestBody == nil || strings.Contains(*record.RequestBody, "hidden") {
+			if record.RequestBody == nil || strings.Contains(string(record.RequestBody.(json.RawMessage)), "hidden") {
 				t.Error("predicate received an unsafe or missing request body")
 			}
 			return record.Status >= 400 || record.Error != nil
@@ -542,7 +549,7 @@ func TestAccessLogCompletionFilter(t *testing.T) {
 		records[1].Level != middleware.AccessLogError || records[1].Error == nil {
 		t.Fatalf("filtered records=%+v", records)
 	}
-	if strings.Contains(*records[0].ResponseBody, "hidden") {
+	if strings.Contains(string(records[0].ResponseBody.(json.RawMessage)), "hidden") {
 		t.Fatal("output received an unredacted body")
 	}
 }
@@ -606,8 +613,8 @@ func TestAccessLogIndependentCaptureLimits(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(httptest.NewRecorder(), req)
 	record := output.snapshot()[0]
-	if *record.RequestBody != "[omitted: body exceeds log limit]" ||
-		!strings.Contains(*record.ResponseBody, "response") {
+	if record.RequestBody != "[omitted: body exceeds log limit]" ||
+		!strings.Contains(string(record.ResponseBody.(json.RawMessage)), "response") {
 		t.Fatalf("independent capture=%+v", record)
 	}
 }
@@ -618,6 +625,8 @@ func TestAccessLogNewConfigurationValidation(t *testing.T) {
 		{Default: middleware.AccessLogPolicy{Finish: true, Request: middleware.AccessLogContent{MaxBodyBytes: -1}}},
 		{Default: middleware.AccessLogPolicy{Finish: true, Response: middleware.AccessLogContent{MaxBodyBytes: 1<<20 + 1}}},
 		{RedactKeys: []string{"_-"}},
+		{Default: middleware.AccessLogPolicy{Request: middleware.AccessLogContent{BodyMode: "Invalid"}}},
+		{Default: middleware.AccessLogPolicy{Request: middleware.AccessLogContent{BodyFormat: "Invalid"}}},
 	}
 	for i, config := range cases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {

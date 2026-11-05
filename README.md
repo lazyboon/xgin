@@ -165,6 +165,8 @@ engine.Use(middleware.AccessLog(middleware.AccessLogConfig{
         Finish: true,
         Request: middleware.AccessLogContent{
             MaxBodyBytes: 4096,
+            BodyMode:     middleware.RequestBodyBuffered,
+            BodyFormat:   middleware.BodyFormatStructured,
         },
         Response: middleware.AccessLogContent{
             MaxBodyBytes: 8192,
@@ -209,7 +211,40 @@ There is one policy path: `Default` sets the base and `Resolve` may replace it f
 
 `HeaderFormatCompact` (the default) emits a single value as a string and multiple values as `[]string`. `HeaderFormatMulti` retains `[]string` values for every header; values are never comma-joined. Each event owns detached, sanitized header snapshots.
 
-Bodies are included **only in completion events**. Request capture observes bytes as the application reads them and never reads ahead; disabling `Finish` disables body capture. A result-based filter still requires bounded capture before the result is known. Complete JSON and URL-encoded forms are redacted; incomplete, malformed, oversized, compressed, binary, attachment, and streaming bodies are omitted with a diagnostic marker. Request and response bodies remain strings in records and slog output, preserving the existing representation. URLs contain paths without query values. Built-in credential masks cannot be disabled; configure `RedactHeaders` and `RedactKeys` for additional secrets. Internal error messages and stacks may contain application secrets; decide whether to retain those in your backend.
+Bodies are included **only in completion events**. Disabling `Body` or `Finish` disables capture and read-ahead. A result-based filter still requires capture before the result is known. URLs contain paths without query values. Built-in credential masks cannot be disabled; configure `RedactHeaders` and `RedactKeys` for additional secrets. Internal error messages and stacks may contain application secrets; decide whether to retain those in your backend.
+
+#### Request capture modes
+
+Set `Default.Request.BodyMode`, or change it per route in `Resolve`:
+
+| Mode | Behavior |
+| --- | --- |
+| `RequestBodyPassive` (default) | Observes only bytes consumed by downstream code. Empty DTOs or early returns may leave the body unread. |
+| `RequestBodyBuffered` | Reads at most `MaxBodyBytes + 1` before downstream code and restores the consumed prefix and any read error. Complete small bodies are available even if the handler never reads them. |
+
+Buffered mode skips declared oversized bodies without reading ahead. For unknown lengths it reads one extra byte to detect overflow, then replays that prefix followed by the untouched remainder. It preserves `ContentLength`, `GetBody`, forwarded `Close`, and access to read errors; read chunk boundaries may change. The log limit does not reject, truncate, or limit the business request. Normal request-size and timeout controls still belong to the HTTP server/binder. Buffered mode waits for the bounded prefix before invoking downstream middleware, which can trigger `100 Continue`; choose passive mode for handlers that must authorize or process streams before reading. Unsupported payloads (including uploads, compressed bodies, and event streams) are never read ahead. `BodyMode` has no effect on response capture; responses are observed as they are written.
+
+Complete JSON and URL-encoded forms are redacted. Unsupported, oversized, incomplete, or malformed payloads are omitted. Markers distinguish `body not read`, `incomplete body`, and `body capture failed`; no partial raw data or raw transport error is substituted for these markers.
+
+#### Body output formats
+
+Set `BodyFormat` independently on `Default.Request` and `Default.Response`, or override it per route:
+
+| Format | Complete JSON body representation |
+| --- | --- |
+| `BodyFormatStructured` (default) | `json.RawMessage` containing freshly encoded, sanitized JSON. Objects/arrays/scalars remain JSON values; explicit `null` remains present. |
+| `BodyFormatText` | A string containing the same sanitized JSON. Useful when log storage needs a stable text field across routes. |
+
+Structured slog output is directly searchable without decoding an escaped JSON string:
+
+```json
+{
+  "request_body": {"email": "user@example.com", "password": "[REDACTED]"},
+  "response_body": {"code": "OK", "data": {"access_token": "[REDACTED]"}}
+}
+```
+
+Both formats validate complete JSON, redact it, and enforce the limit again after encoding; large JSON integers retain their precision. Form bodies and omission markers remain strings. Arbitrary JSON body shapes can conflict with strict dynamic field mappings in log indexes; configure those fields as appropriate for your collector, or select `BodyFormatText` consistently. Neither mode logs an unredacted raw-body prefix.
 
 For zap or another backend, implement the single-method interface or use the function adapter. This example belongs in the application; xgin does not import zap:
 
@@ -233,6 +268,10 @@ output := middleware.AccessLoggerFunc(func(_ context.Context, record middleware.
 ```
 
 `AccessRecord.Fields()` returns backend-neutral structured fields and omits disabled payloads. Start events omit status/duration; completion severity is Error for internal errors or status >= 500, Warn for status >= 400, otherwise Info. The backend owns buffering, output failures, flushing, and shutdown; the middleware does not close a shared logger. Records may be retained, but handler errors must not be mutated. Middleware callbacks and output run synchronously on the request goroutine; their panics are not swallowed.
+
+### Upgrading to v1.5.0
+
+`AccessRecord.RequestBody` and `ResponseBody` now use `any` instead of `*string`: nil means disabled, `json.RawMessage` means complete structured JSON, and string means text/form data or an omission marker. Custom loggers should use `record.Fields()` with a JSON-aware encoder (as slog and zap do), rather than converting values to strings or byte slices. Filters that inspect bodies must account for these types. To retain textual JSON output, set `BodyFormatText` for both directions.
 
 ### Upgrading to v1.4.0
 

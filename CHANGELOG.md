@@ -1,5 +1,14 @@
 # Changelog
 
+## [v1.5.0] - 2026-11-05
+
+This release retains the v1 module path. JSON body output is now structured by default, and custom loggers must account for the updated access-record body field types.
+
+- Add configurable passive and buffered request-body capture, including bounded read-ahead and replay of consumed bytes/errors without changing business request limits.
+- Default complete, sanitized JSON bodies to structured values; add independent text-format selection for requests and responses. `AccessRecord` body fields now use `any` (nil, `json.RawMessage`, or string).
+- Distinguish unread, incomplete, and failed body capture instead of reporting all cases as incomplete.
+- Add empty-DTO, stream replay, exact-limit/overflow, unsupported payload, JSON format, explicit-null, integer-precision, and redaction regression coverage.
+
 ## [v1.4.0] - 2026-11-05
 
 This release intentionally includes incompatible access-log API changes while retaining the v1 module path.
